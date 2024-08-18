@@ -361,6 +361,63 @@ class LlamaAttention(nn.Module):
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
+    def zero_worst_attn(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
+        with torch.no_grad():
+            # _, worst_indices = attn_weights.topk(sliding_window_size, dim=-1, largest=False)
+            attn_weights.scatter_(3, attn_weights.topk(finite_states_size, dim=-1, largest=False).indices, -torch.inf)
+            # attn_weights.index_select(-1, torch.tensor([0, 1]).to("cuda"))
+            # z = torch.zeros(1, 32, size, size).to("cuda")
+            # worst_indices = z.scatter_(3, worst_indices, 1).bool()
+            # attn_weights[worst_indices] = -torch.inf
+            # for iteration in range(size - sliding_window_size):
+            #     _, worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(iteration + 1, -1, False)
+            #     z = torch.zeros(1, 32, size).to("cuda")
+            #     worst_indices = z.scatter_(2, worst_indices, 1).bool()
+            #     # worst_indices = worst_indices.squeeze(-1)[0]
+            #     attn_weights[:, :, sliding_window_size + iteration][worst_indices] = -torch.inf
+        return attn_weights
+
+    def zero_worst_attn2(self, attn_weights: torch.Tensor, sliding_window_size=2048, size=4096):
+        for iteration in range(size - sliding_window_size):
+            _, worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(iteration + 1, -1, False)
+            z = torch.zeros(1, 32, size).to("cuda")
+            worst_indices = z.scatter_(2, worst_indices, 1).bool()
+            # worst_indices = worst_indices.squeeze(-1)[0]
+            attn_weights[:, :, sliding_window_size + iteration][worst_indices] = -torch.inf
+        return attn_weights
+
+    def zero_worst_attn3(self, attn_weights: torch.Tensor, sliding_window_size=2048, size=4096):
+        for iteration in range(size - sliding_window_size):
+            worst_indices = attn_weights[:, :, sliding_window_size + iteration :, :].topk(1, -1, False).indices
+            z = torch.zeros(1, 32, size - (size - sliding_window_size + iteration), size).to("cuda")
+            worst_indices = z.scatter_(3, worst_indices, 1).bool()
+            # worst_indices = worst_indices.squeeze(-1)[0]
+            attn_weights[:, :, size - sliding_window_size + iteration:][worst_indices] = torch.inf
+        return attn_weights
+
+    # The only TOVA
+    def zero_worst_attn4(self, attn_weights: torch.Tensor, sliding_window_size=2048, size=4096):
+        for iteration in range(size - sliding_window_size):
+            worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(1, -1, False).indices
+            worst_indices = worst_indices.unsqueeze(-2).expand((1, 32, size - (size - sliding_window_size + iteration), 1))
+            z = torch.zeros(1, 32, size - (size - sliding_window_size + iteration), size).to("cuda")
+            worst_indices = z.scatter_(3, worst_indices, 1).bool()
+            # worst_indices = worst_indices.squeeze(-1)[0]
+            attn_weights[:, :, size - sliding_window_size + iteration:][worst_indices] = torch.inf
+        return attn_weights
+
+
+    #
+    #
+    # def zero_worst_attn3(self, attn_weights: torch.Tensor, sliding_window_size=2048, size=4096):
+    #     for iteration in range(size - sliding_window_size):
+    #         worst_indices = attn_weights[:, :, sliding_window_size + iteration :, :].topk(1, -1, False).indices
+    #         z = torch.zeros(1, 32, size - (size - sliding_window_size + iteration), size).to("cuda")
+    #         worst_indices = z.scatter_(3, worst_indices, 1).bool()
+    #         # worst_indices = worst_indices.squeeze(-1)[0]
+    #         attn_weights[:, :, size - sliding_window_size + iteration:][worst_indices] = torch.inf
+    #     return attn_weights
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -425,9 +482,43 @@ class LlamaAttention(nn.Module):
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            causal_mask = torch.where(causal_mask == 0, 0, torch.inf)
             attn_weights = attn_weights + causal_mask
 
+        attn_weights = self.zero_worst_attn4(attn_weights)
+        attn_weights = torch.where(attn_weights == torch.inf, -torch.inf, attn_weights)
+
+        # attn_weights = torch.where(attn_weights == torch.inf, -torch.inf, attn_weights)
+
+        # v, s = torch.sort(attn_weights)
+        #
+        #
+        # lower_tri_left_ones = torch.tril(torch.ones(1, 32, key_states.shape[-2], key_states.shape[-2])).bool()
+        # mat = torch.zeros((1, 32, 4096, 4096)).bool()
+        # s_inf = torch.where(lower_tri_left_ones.to("cuda") == False, -1, s)
+        # torch.where(lower_tri_left_ones.to("cuda") == False, -torch.inf, attn_weights[s])
+        # mat[s[lower_tri_left_ones]] = True
+        # attn_weights[mat] = torch.inf
+        # torch.where(attn_weights != torch.inf, attn_weights, -torch.inf)
+        # #TODO Is some smart normalization step required after we drop values?
+        # #TODO: Why torch's functions rounding my values? I think it hurt performance.
+        # #x = torch.where(attn_weights < 0, 2, attn_weights)
+        # # mask = torch.tril(torch.ones(1, 32, key_states.shape[-2], key_states.shape[-2]))
+        # # min_index = torch.where(mask, attn_weights).argmin()
+        # # torch.where(mask.bool().to("cuda"), attn_weights, torch.inf).min(-1)
+        # # Algorithm
+        # # Make minuses be inf
+        # # s = Sort the indices in ascending order. That's not as good as top k since nlogn
+        # # Take the sorted matrix, apply a triangular left lower mask on it, and for all the indecies we got, build another matrix which has "true" there.
+        # #
+        # # mat = torch.zeros((1, 32, 4096, 4096)).bool()
+        # # aaaa = torch.where(attn_weights >= 0, attn_weights, torch.inf)
+        # # mat[s[lower_tri_left_ones]] = True
+        # # attn_weights[mat] = -float('inf')
+        # #
+        # # torch.where(mask.bool().to("cuda"), attn_weights, torch.inf).min(dim=3, keepdim=True).indices[0][0][8]
         # upcast attention to fp32
+        # validation - torch.isfinite(attn_weights[0][0][3000]).sum() == 2048
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)

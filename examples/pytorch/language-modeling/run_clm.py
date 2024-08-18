@@ -248,6 +248,7 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    model_args.model_name_or_path = "mistralai/Mistral-7B-v0.1"
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_clm", model_args, data_args)
@@ -373,7 +374,9 @@ def main():
                 token=model_args.token,
                 **dataset_args,
             )
-
+    raw_datasets["train"] = raw_datasets["train"].select((0, 0))
+    raw_datasets["test"] = raw_datasets["test"].select((0, 0))
+    raw_datasets["validation"] = raw_datasets["validation"].select((0, 1))
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
 
@@ -401,6 +404,9 @@ def main():
             config.update_from_string(model_args.config_overrides)
             logger.info(f"New config: {config}")
 
+    config._attn_implementation = "eager"
+    config.finite_states_size = 64
+    # config.sliding_window = 2048
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -558,7 +564,8 @@ def main():
     if training_args.do_eval:
         if "validation" not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = lm_datasets["validation"]
+        eval_dataset = lm_datasets["validation"]#.select((0, 1))
+        # eval_dataset = lm_datasets["validation"]
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))

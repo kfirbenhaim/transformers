@@ -46,7 +46,11 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_mistral import MistralConfig
+from collections import OrderedDict
 
+import cProfile as profile
+pr = profile.Profile()
+pr.disable()
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -207,6 +211,108 @@ class MistralAttention(nn.Module):
             base=self.rope_theta,
         )
 
+
+    def optimal_tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
+        with torch.no_grad():
+            # _, worst_indices = attn_weights.topk(sliding_window_size, dim=-1, largest=False)
+            attn_weights.scatter_(3, attn_weights.topk(size - finite_states_size, dim=-1, largest=False).indices, -torch.inf)
+            # attn_weights.index_select(-1, torch.tensor([0, 1]).to("cuda"))
+            # z = torch.zeros(1, 32, size, size).to("cuda")
+            # worst_indices = z.scatter_(3, worst_indices, 1).bool()
+            # attn_weights[worst_indices] = -torch.inf
+            # for iteration in range(size - sliding_window_size):
+            #     _, worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(iteration + 1, -1, False)
+            #     z = torch.zeros(1, 32, size).to("cuda")
+            #     worst_indices = z.scatter_(2, worst_indices, 1).bool()
+            #     # worst_indices = worst_indices.squeeze(-1)[0]
+            #     attn_weights[:, :, sliding_window_size + iteration][worst_indices] = -torch.inf
+        return attn_weights
+
+    # The only TOVA
+    def tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
+        # assume all -inf are now inf. After this function, revert all inf to -inf.
+        num_rows_to_clean = size - finite_states_size
+        for iteration in range(num_rows_to_clean):
+            index_of_row_to_clean = finite_states_size + iteration
+            worst_indices = attn_weights[:, :, index_of_row_to_clean, :].topk(1, -1, False).indices
+            worst_indices = worst_indices.unsqueeze(-2).expand((1, 32, size - index_of_row_to_clean, 1))
+            attn_weights[:, :, index_of_row_to_clean:].scatter_(3, worst_indices, torch.inf)
+        return attn_weights
+
+    # The only TOVA
+    def revive_tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096, revive_each=1):
+        # assume all -inf are now inf. After this function, revert all inf to -inf.
+        attn_weights_const = attn_weights.clone()
+        # ordered_dropped_tokens = OrderedDict()
+        dropped_tokens_indices = None
+        dropped_tokens_values = None
+        num_rows_to_clean = size - finite_states_size
+        for iteration in range(num_rows_to_clean):
+            index_of_row_to_clean = finite_states_size + iteration
+
+            ### Revive
+            if iteration % revive_each == 0 and not iteration == 0:
+                token_to_revive_val = dropped_tokens_values.topk(1, 0, sorted=False)
+                for head in range(32):
+                    # Remove from dropped_tokens_value by making it inf for simplicity
+                    dropped_tokens_values[token_to_revive_val.indices[0, head], head] = -torch.inf
+                    token_to_revive_index = dropped_tokens_indices[token_to_revive_val.indices[0, head], head]
+                    token_to_revive_value = attn_weights_const[0, head, index_of_row_to_clean, token_to_revive_index] #token_to_revive_val.values[0, head]
+                    attn_weights[0, head, index_of_row_to_clean, token_to_revive_index] = token_to_revive_value
+
+                    # Remove from dropped_tokens_value by making it inf for simplicity
+                    # dropped_tokens_values = torch.cat((dropped_tokens_values[:token_to_revive_val.indices], dropped_tokens_values[token_to_revive_val.indices + 1:]))
+                    # token_to_revive_index = dropped_tokens_indices[token_to_revive_val.indices]
+                    # token_to_revive_value = token_to_revive_val.values
+                    ## Rremove from dropped_tokens_indices
+                    # dropped_tokens_indices = torch.cat((dropped_tokens_indices[:token_to_revive_val.indices], dropped_tokens_indices[token_to_revive_val.indices + 1:]))
+                    # attn_weights[0, head, iteration, token_to_revive_index] = token_to_revive_value
+            ### End revive
+            worst = attn_weights[:, :, index_of_row_to_clean, :].topk(1, -1, False)
+            worst_indices = worst.indices
+
+            ### Add for revived tova
+            if iteration == 0:
+                dropped_tokens_indices = worst_indices
+                dropped_tokens_values = worst.values
+            # elif iteration == 1:
+            #     dropped_tokens_indices = torch.stack((dropped_tokens_indices[0], worst_indices[0]))
+            #     dropped_tokens_values = torch.stack((dropped_tokens_values[0], worst.values[0]))
+            else:
+                dropped_tokens_indices = torch.cat((dropped_tokens_indices, worst_indices))
+                dropped_tokens_values = torch.cat((dropped_tokens_values, worst.values))
+            ### End add
+
+            worst_indices = worst_indices.unsqueeze(-2).expand((1, 32, size - index_of_row_to_clean, 1))
+            attn_weights[:, :, index_of_row_to_clean:].scatter_(3, worst_indices, torch.inf)
+        return attn_weights
+
+    def zero_worst_attn5(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
+        # pr.enable()
+        # assume all -inf are now inf. After this function, revert all inf to -inf.
+        num_rows_to_clean = size - finite_states_size
+        worst_indices = attn_weights[:, :, finite_states_size:, :].topk(1, -1, False).indices
+        worst_mask = worst_indices.unsqueeze(-2).expand((1, 32, num_rows_to_clean, 1)) == worst_indices
+
+    def zero_worst_attn6(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
+        sorted_values, sorted_indices = torch.sort(attn_weights, dim=-1)
+        attn_weights.scatter_(3, sorted_indices[:, :, :, :size - finite_states_size], -torch.inf)
+
+    def zero_worst_attn7(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
+        with torch.no_grad():
+            # _, worst_indices = attn_weights.topk(sliding_window_size, dim=-1, largest=False)
+            attn_weights.scatter_(3, attn_weights.topk(size - finite_states_size, dim=-1, largest=False, sorted=False).indices, -torch.inf)
+            # attn_weights.index_select(-1, torch.tensor([0, 1]).to("cuda"))
+            # z = torch.zeros(1, 32, size, size).to("cuda")
+            # worst_indices = z.scatter_(3, worst_indices, 1).bool()
+            # attn_weights[worst_indices] = -torch.inf
+            # for iteration in range(size - sliding_window_size):
+            #     _, worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(iteration + 1, -1, False)
+            #     z = torch.zeros(1, 32, size).to("cuda")
+            #     worst_indices = z.scatter_(2, worst_indices, 1).bool()
+            #     # worst_indices = worst_indices.squeeze(-1)[0]
+            #     attn_weights[:, :, sliding_window_size + iteration][worst_indices] = -torch.inf
+        return attn_weights
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -239,10 +345,14 @@ class MistralAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            causal_mask = torch.where(causal_mask == 0, 0, torch.inf)
             attn_weights = attn_weights + causal_mask
+        # self.zero_worst_attn7(attn_weights, 8)
+        # self.zero_worst_attn4(attn_weights, 64)
+        self.revive_tova(attn_weights, 256)
+        attn_weights = torch.where(attn_weights == torch.inf, -torch.inf, attn_weights)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
