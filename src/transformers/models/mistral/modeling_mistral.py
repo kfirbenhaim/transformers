@@ -173,6 +173,18 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+# _, worst_indices = attn_weights.topk(sliding_window_size, dim=-1, largest=False)
+
+# attn_weights.index_select(-1, torch.tensor([0, 1]).to("cuda"))
+# z = torch.zeros(1, 32, size, size).to("cuda")
+# worst_indices = z.scatter_(3, worst_indices, 1).bool()
+# attn_weights[worst_indices] = -torch.inf
+# for iteration in range(size - sliding_window_size):
+#     _, worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(iteration + 1, -1, False)
+#     z = torch.zeros(1, 32, size).to("cuda")
+#     worst_indices = z.scatter_(2, worst_indices, 1).bool()
+#     # worst_indices = worst_indices.squeeze(-1)[0]
+#     attn_weights[:, :, sliding_window_size + iteration][worst_indices] = -torch.inf
 class MistralAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
@@ -213,20 +225,7 @@ class MistralAttention(nn.Module):
 
 
     def optimal_tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
-        with torch.no_grad():
-            # _, worst_indices = attn_weights.topk(sliding_window_size, dim=-1, largest=False)
-            attn_weights.scatter_(3, attn_weights.topk(size - finite_states_size, dim=-1, largest=False).indices, -torch.inf)
-            # attn_weights.index_select(-1, torch.tensor([0, 1]).to("cuda"))
-            # z = torch.zeros(1, 32, size, size).to("cuda")
-            # worst_indices = z.scatter_(3, worst_indices, 1).bool()
-            # attn_weights[worst_indices] = -torch.inf
-            # for iteration in range(size - sliding_window_size):
-            #     _, worst_indices = attn_weights[:, :, sliding_window_size + iteration, :].topk(iteration + 1, -1, False)
-            #     z = torch.zeros(1, 32, size).to("cuda")
-            #     worst_indices = z.scatter_(2, worst_indices, 1).bool()
-            #     # worst_indices = worst_indices.squeeze(-1)[0]
-            #     attn_weights[:, :, sliding_window_size + iteration][worst_indices] = -torch.inf
-        return attn_weights
+        attn_weights.scatter_(3, attn_weights.topk(size - finite_states_size, dim=-1, largest=False).indices, -torch.inf)
 
     # The only TOVA
     def tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096):
@@ -239,8 +238,8 @@ class MistralAttention(nn.Module):
             attn_weights[:, :, index_of_row_to_clean:].scatter_(3, worst_indices, torch.inf)
         return attn_weights
 
-    # The only TOVA
-    def revive_tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096, revive_each=1):
+    # 2 layers cache
+    def revive_tova(self, attn_weights: torch.Tensor, finite_states_size=2048, size=4096, revive_each=1, num_tokens_revived=3):
         # assume all -inf are now inf. After this function, revert all inf to -inf.
         attn_weights_const = attn_weights.clone()
         # ordered_dropped_tokens = OrderedDict()
@@ -251,8 +250,8 @@ class MistralAttention(nn.Module):
             index_of_row_to_clean = finite_states_size + iteration
 
             ### Revive
-            if iteration % revive_each == 0 and not iteration == 0:
-                token_to_revive_val = dropped_tokens_values.topk(1, 0, sorted=False)
+            if iteration % revive_each == 0 and iteration >= num_tokens_revived:
+                token_to_revive_val = dropped_tokens_values.topk(num_tokens_revived, 0, sorted=False)
                 for head in range(32):
                     # Remove from dropped_tokens_value by making it inf for simplicity
                     dropped_tokens_values[token_to_revive_val.indices[0, head], head] = -torch.inf
@@ -351,7 +350,7 @@ class MistralAttention(nn.Module):
             attn_weights = attn_weights + causal_mask
         # self.zero_worst_attn7(attn_weights, 8)
         # self.zero_worst_attn4(attn_weights, 64)
-        self.revive_tova(attn_weights, 256)
+        self.tova(attn_weights, 64)
         attn_weights = torch.where(attn_weights == torch.inf, -torch.inf, attn_weights)
 
         # upcast attention to fp32

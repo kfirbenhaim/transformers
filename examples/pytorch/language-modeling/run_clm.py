@@ -374,9 +374,9 @@ def main():
                 token=model_args.token,
                 **dataset_args,
             )
-    raw_datasets["train"] = raw_datasets["train"].select((0, 0))
-    raw_datasets["test"] = raw_datasets["test"].select((0, 0))
-    raw_datasets["validation"] = raw_datasets["validation"].select((0, 1))
+    raw_datasets["train"] = raw_datasets["train"].select(range(0, 0))
+    raw_datasets["test"] = raw_datasets["test"].select(range(0, 0))
+    raw_datasets["validation"] = raw_datasets["validation"].select(range(1, 16))
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
 
