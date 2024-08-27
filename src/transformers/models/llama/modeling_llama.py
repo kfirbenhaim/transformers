@@ -521,7 +521,87 @@ class LlamaAttention(nn.Module):
         mask = mask.to(attn_weights.dtype)
         return mask
 
-    def get_revival_cache_mask(self, cache_type, cache_size, attn_weights, attn_mask, revive_each=1, num_tokens_revived=1):
+    def get_refreshed_cache_mask(self, cache_type, cache_size, attn_weights, attn_mask, refresh_each=248):
+        bsz, num_heads, src_len, tgt_len = attn_weights.shape
+
+        if cache_type == 'regular' or torch.all(attn_mask == 0):
+            mask = torch.zeros_like(attn_weights)
+
+        elif 'window' in cache_type:
+            mask = torch.full((tgt_len, tgt_len), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            if cache_type == 'window':
+                mask.masked_fill_(mask_cond > (mask_cond - (cache_size + 1)).view(mask.size(-1), 1), 0)
+            elif '+1' in cache_type:
+                mask.masked_fill_(mask_cond > (mask_cond - cache_size).view(mask.size(-1), 1), 0)
+                mask[:, 0] = 0
+            elif '+4' in cache_type:
+                mask.masked_fill_(mask_cond > (mask_cond - (cache_size - 3)).view(mask.size(-1), 1), 0)
+                mask[:, 0:4] = 0
+            elif '+73' in cache_type:
+                mask.masked_fill_(mask_cond > (mask_cond - (cache_size - 72)).view(mask.size(-1), 1), 0)
+                mask[:, 0:73] = 0
+            else:
+                raise NotImplementedError("pick relevant window prefix")
+
+        elif cache_type in ['block']:
+            mask = torch.full((tgt_len, tgt_len), torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+            mask.masked_fill_(mask_cond >= (mask_cond.view(mask.size(-1), 1) // (cache_size + 1)) * (cache_size + 1), 0)
+
+        elif cache_type in ['by_att_head', 'by_att_head+1', 'random_head', 'random_head+1']:
+            if 'random' in cache_type:
+                tmp_attn_weights = torch.rand_like(attn_weights).clone().detach() + attn_mask
+            else:
+                tmp_attn_weights = attn_weights.clone().detach()
+            tmp_attn_weights.masked_fill_(
+                torch.logical_or(tmp_attn_weights == torch.finfo(tmp_attn_weights.dtype).min,
+                                 tmp_attn_weights == -torch.inf),
+                torch.finfo(attn_weights.dtype).max)
+            for i in range(cache_size, tgt_len):
+                if '+1' in cache_type:
+                    argmins = torch.argmin(tmp_attn_weights[:, :, i, 1:], dim=-1) + 1
+                else:
+                    argmins = torch.argmin(tmp_attn_weights[:, :, i, :], dim=-1)
+
+                idx_0, idx_1 = torch.meshgrid(torch.arange(bsz), torch.arange(num_heads))
+                tmp_attn_weights[idx_0, idx_1, i + 1:, argmins] = torch.finfo(attn_weights.dtype).max
+
+            mask = torch.full(attn_weights.shape, torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = (tmp_attn_weights != torch.finfo(attn_weights.dtype).max)
+            mask.masked_fill_(mask_cond, 0)
+
+        elif cache_type in ['by_att_layer', 'by_att_layer+1', 'by_att_layer+4', 'random_layer', 'random_layer+1',
+                            'random_layer+4']:
+            if 'random' in cache_type:
+                tmp_attn_weights = torch.rand_like(attn_weights).clone().detach() + attn_mask
+            else:
+                tmp_attn_weights = attn_weights.clone().detach()
+            tmp_attn_weights = torch.sum(tmp_attn_weights.clone().detach(), dim=1)
+            tmp_attn_weights.masked_fill_(
+                torch.logical_or(tmp_attn_weights == torch.finfo(tmp_attn_weights.dtype).min,
+                                 tmp_attn_weights == -torch.inf),
+                torch.finfo(attn_weights.dtype).max)
+            for i in range(cache_size, tgt_len):
+                if '+1' in cache_type:
+                    argmins = torch.argmin(tmp_attn_weights[:, i, 1:], dim=-1) + 1
+                elif '+4' in cache_type:
+                    argmins = torch.argmin(tmp_attn_weights[:, i, 4:], dim=-1) + 4
+                else:
+                    argmins = torch.argmin(tmp_attn_weights[:, i, :], dim=-1)
+
+                tmp_attn_weights[torch.arange(bsz), i + 1:, argmins] = torch.finfo(attn_weights.dtype).max
+
+            mask = torch.full(attn_weights.shape, torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
+            mask_cond = (tmp_attn_weights != torch.finfo(attn_weights.dtype).max)
+            mask.masked_fill_(mask_cond.unsqueeze(1), 0)
+        else:
+            raise NotImplementedError(f"No such cahce type: {cache_type}")
+
+        mask = mask.to(attn_weights.dtype)
+        return mask
+
+    def get_revival_cache_mask(self, cache_type, cache_size, attn_weights, attn_mask, revive_each=1, num_tokens_revived=1, refresh_each=100):
         bsz, num_heads, src_len, tgt_len = attn_weights.shape
 
         # Containers for reviving
@@ -633,16 +713,25 @@ class LlamaAttention(nn.Module):
                     iteration = index_of_row_to_clean - cache_size
                     # Check if we should revive in this iteration
                     if iteration % revive_each == 0 and index_of_row_to_clean >= num_tokens_revived + cache_size:
+                        if iteration % revive_each == 0:
+                            num_tokens_revived = dropped_tokens_values.size(0)
                         token_to_revive_val = dropped_tokens_values.topk(num_tokens_revived, 0, sorted=False)
                         # A very inefficient implementation, but good enough for a PoC.
                         # Remove the revived token from dropped_tokens_value by making it min for simplicity
-                        dropped_tokens_values[token_to_revive_val.indices[0]] = torch.finfo(attn_weights.dtype).min
                         token_to_revive_index = dropped_tokens_indices[token_to_revive_val.indices[0]]
+
                         token_to_revive_value = attn_weights[0, :, index_of_row_to_clean:, token_to_revive_index]
                         sum_revived_token_over_heads = token_to_revive_value.sum(dim=0)
                         tmp_attn_weights[0, index_of_row_to_clean:, token_to_revive_index] = sum_revived_token_over_heads
                         worst = tmp_attn_weights[:, index_of_row_to_clean, :].topk(1 + num_tokens_revived, -1, False)
                         worst_indices = worst.indices
+
+                        # Remove the revived from the dropped tokens list
+                        dropped_index_to_revive = token_to_revive_val.indices[0, 0].item()
+                        dropped_tokens_values = torch.cat((dropped_tokens_values[:dropped_index_to_revive], dropped_tokens_values[dropped_index_to_revive+1:]))
+                        dropped_tokens_indices = torch.cat((dropped_tokens_indices[:dropped_index_to_revive], dropped_tokens_indices[dropped_index_to_revive+1:]))
+
+                        # Add the dropped token to the dropped tokens list
                         if iteration == 0:
                             dropped_tokens_indices = worst_indices
                             dropped_tokens_values = worst.values
@@ -651,10 +740,13 @@ class LlamaAttention(nn.Module):
                                 (dropped_tokens_indices, torch.cat(worst_indices.split(1, dim=-1))))
                             dropped_tokens_values = torch.cat(
                                 (dropped_tokens_values, torch.cat(worst.values.split(1, dim=-1))))
+
+                        # Remove the dropped token from the temp attn weights
                         worst_indices = worst_indices.unsqueeze(-2).expand(
                             (1, tgt_len - index_of_row_to_clean - 1, 1 + num_tokens_revived))
                         tmp_attn_weights[:, index_of_row_to_clean + 1:].scatter_(-1, worst_indices,
                                                                                     torch.finfo(attn_weights.dtype).max)
+
                     else:
                         # End reviving
                         worst = tmp_attn_weights[:, index_of_row_to_clean, :].topk(1, -1, False)
@@ -857,7 +949,7 @@ class LlamaAttention(nn.Module):
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
-            attn_weights = attn_weights + self.get_original_cache_mask(cache_type=cache_type, cache_size=cache_size,
+            attn_weights = attn_weights + self.get_revival_cache_mask(cache_type=cache_type, cache_size=cache_size,
                                                               attn_weights=attn_weights, attn_mask=attention_mask)
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
